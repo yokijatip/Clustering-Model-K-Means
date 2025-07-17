@@ -1,0 +1,1520 @@
+main.py:
+#!/usr/bin/env python3
+"""
+Main script for training K-means worker performance analysis model
+"""
+
+import os
+import sys
+import logging
+from datetime import datetime
+
+# Import our modules
+from firebase_client import FirebaseClient
+from data_processor import DataProcessor
+from kmeans_model import WorkerKMeansModel
+from tflite_converter import TFLiteConverter
+from config import Config
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('training.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+def main():
+    """Main training pipeline"""
+    logger.info("Starting Worker Performance Analysis Model Training")
+    
+    try:
+        # Step 1: Initialize Firebase client
+        logger.info("Step 1: Initializing Firebase client...")
+        firebase_client = FirebaseClient()
+        
+        # Step 2: Fetch data from Firestore
+        logger.info("Step 2: Fetching data from Firestore...")
+        result = firebase_client.get_worker_performance_data()
+        
+        if not result:
+            logger.error("No data returned from Firestore. Please check your database.")
+            return False
+        
+        if len(result) != 2:
+            logger.error("Invalid data structure returned from Firestore.")
+            return False
+            
+        workers_df, attendance_df = result
+        
+        if workers_df.empty:
+            logger.error("No workers data found in Firestore.")
+            return False
+            
+        if attendance_df.empty:
+            logger.error("No attendance data found in Firestore.")
+            logger.info("Please check:")
+            logger.info("1. Collection name is 'attendance'")
+            logger.info("2. Date field format is 'YYYY-MM-DD'")
+            logger.info("3. There are attendance records in the last 30 days")
+            return False
+        
+        logger.info(f"Found {len(workers_df)} workers and {len(attendance_df)} attendance records")
+        
+        # Step 3: Process data
+        logger.info("Step 3: Processing worker performance data...")
+        data_processor = DataProcessor()
+        processed_data = data_processor.process_worker_data(workers_df, attendance_df)
+        
+        if processed_data.empty:
+            logger.error("No processed data available for training")
+            return False
+        
+        # Step 4: Prepare features for clustering
+        logger.info("Step 4: Preparing features for clustering...")
+        feature_matrix, feature_names = data_processor.get_feature_matrix()
+        
+        logger.info(f"Feature matrix shape: {feature_matrix.shape}")
+        logger.info(f"Features: {feature_names}")
+        
+        # Step 5: Train K-means model
+        logger.info("Step 5: Training K-means clustering model...")
+        kmeans_model = WorkerKMeansModel()
+        cluster_labels = kmeans_model.train_model(feature_matrix, feature_names)
+        
+        # Step 6: Assign performance labels
+        logger.info("Step 6: Assigning performance labels...")
+        final_data, performance_mapping = kmeans_model.assign_performance_labels(
+            processed_data, cluster_labels
+        )
+        
+        # Step 7: Create visualizations
+        logger.info("Step 7: Creating visualizations...")
+        kmeans_model.visualize_clusters(final_data)
+        
+        # Step 8: Save the model
+        logger.info("Step 8: Saving the trained model...")
+        kmeans_model.save_model()
+        
+        # Step 9: Convert to TFLite
+        logger.info("Step 9: Converting model to TensorFlow Lite...")
+        tflite_converter = TFLiteConverter()
+        
+        if tflite_converter.load_sklearn_model():
+            if tflite_converter.convert_to_tflite():
+                logger.info("TFLite conversion successful!")
+                
+                # Test the TFLite model
+                logger.info("Step 10: Testing TFLite model...")
+                test_sample = feature_matrix[:1]  # Use first sample for testing
+                tflite_converter.test_tflite_model(test_sample)
+            else:
+                logger.error("TFLite conversion failed")
+                return False
+        else:
+            logger.error("Failed to load sklearn model for conversion")
+            return False
+        
+        # Step 11: Display results summary
+        logger.info("Step 11: Training completed successfully!")
+        display_results_summary(final_data, performance_mapping)
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Training failed with error: {e}")
+        return False
+
+def display_results_summary(final_data, performance_mapping):
+    """Display training results summary"""
+    logger.info("\n" + "="*50)
+    logger.info("TRAINING RESULTS SUMMARY")
+    logger.info("="*50)
+    
+    # Performance distribution
+    performance_counts = final_data['performance_label'].value_counts()
+    logger.info("\nPerformance Distribution:")
+    for label, count in performance_counts.items():
+        percentage = (count / len(final_data)) * 100
+        logger.info(f"  {label}: {count} workers ({percentage:.1f}%)")
+    
+    # Cluster mapping
+    logger.info("\nCluster to Performance Mapping:")
+    for cluster_id, label in performance_mapping.items():
+        logger.info(f"  Cluster {cluster_id}: {label}")
+    
+    # Feature statistics by performance level
+    logger.info("\nAverage Features by Performance Level:")
+    feature_cols = ['attendance_rate', 'avg_work_hours', 'punctuality_score', 'consistency_score']
+    stats = final_data.groupby('performance_label')[feature_cols].mean()
+    
+    for performance_level in stats.index:
+        logger.info(f"\n  {performance_level}:")
+        for feature in feature_cols:
+            value = stats.loc[performance_level, feature]
+            logger.info(f"    {feature}: {value:.2f}")
+    
+    # Files created
+    logger.info("\nFiles Created:")
+    logger.info(f"  - Model: {Config.MODEL_PATH}")
+    logger.info(f"  - Scaler: {Config.SCALER_PATH}")
+    logger.info(f"  - TFLite Model: {Config.TFLITE_MODEL_PATH}")
+    logger.info(f"  - Metadata: {Config.METADATA_PATH}")
+    logger.info(f"  - TFLite Info: models/tflite_model_info.json")
+    logger.info(f"  - Visualization: cluster_visualization.png")
+    logger.info(f"  - Training Log: training.log")
+
+if __name__ == "__main__":
+    success = main()
+    if success:
+        logger.info("Training pipeline completed successfully!")
+        sys.exit(0)
+    else:
+        logger.error("Training pipeline failed!")
+        sys.exit(1)
+
+config.py:
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+class Config:
+    # Firebase configuration
+    FIREBASE_CREDENTIALS_PATH = os.getenv('FIREBASE_CREDENTIALS_PATH', 'firebase-credentials.json')
+    
+    # Date range configuration
+    START_DATE = '2024-11-01'  # Format: YYYY-MM-DD
+    END_DATE = '2025-01-31'    # Format: YYYY-MM-DD
+    
+    # Model configuration
+    N_CLUSTERS = 3
+    CLUSTER_LABELS = {
+        0: 'Low Performer',
+        1: 'Medium Performer', 
+        2: 'High Performer'
+    }
+    
+    # Feature weights for clustering
+    FEATURE_WEIGHTS = {
+        'attendance_rate': 0.3,
+        'avg_work_hours': 0.25,
+        'punctuality_score': 0.25,
+        'consistency_score': 0.2
+    }
+    
+    # Model paths
+    MODEL_PATH = 'models/kmeans_worker_model.joblib'
+    SCALER_PATH = 'models/scaler.joblib'
+    TFLITE_MODEL_PATH = 'models/worker_analysis_model.tflite'
+    METADATA_PATH = 'models/model_metadata.json'
+
+data_processor.py:
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import logging
+
+logger = logging.getLogger(__name__)
+
+class DataProcessor:
+    def __init__(self):
+        self.processed_data = None
+    
+    def calculate_attendance_rate(self, worker_id, attendance_df):
+        """Calculate attendance rate for a worker"""
+        worker_attendance = attendance_df[attendance_df['userId'] == worker_id]
+        
+        # Count approved attendance
+        approved_days = len(worker_attendance[worker_attendance['status'] == 'approved'])
+        
+        # Calculate working days from config date range
+        working_days = self._calculate_working_days_from_config()
+        
+        attendance_rate = (approved_days / working_days) * 100 if working_days > 0 else 0
+        return min(attendance_rate, 100)  # Cap at 100%
+    
+    def calculate_avg_work_hours(self, worker_id, attendance_df):
+        """Calculate average work hours per day"""
+        worker_attendance = attendance_df[
+            (attendance_df['userId'] == worker_id) & 
+            (attendance_df['status'] == 'approved')
+        ]
+        
+        if worker_attendance.empty:
+            return 0
+        
+        # Convert workMinutes to hours
+        work_hours = worker_attendance['workMinutes'] / 60
+        return work_hours.mean()
+    
+    def calculate_punctuality_score(self, worker_id, attendance_df):
+        """Calculate punctuality score based on clock in/out times"""
+        worker_attendance = attendance_df[
+            (attendance_df['userId'] == worker_id) & 
+            (attendance_df['status'] == 'approved')
+        ]
+        
+        if worker_attendance.empty:
+            return 0
+        
+        punctual_days = 0
+        total_days = len(worker_attendance)
+        
+        for _, record in worker_attendance.iterrows():
+            # Use the string version for easier parsing
+            clock_in_time = record.get('clockInTime_string', '')
+            clock_out_time = record.get('clockOutTime_string', '')
+            
+            # Simple punctuality check (can be enhanced)
+            if self._is_punctual(clock_in_time, clock_out_time):
+                punctual_days += 1
+        
+        return (punctual_days / total_days) * 100 if total_days > 0 else 0
+    
+    def calculate_consistency_score(self, worker_id, attendance_df):
+        """Calculate work consistency score"""
+        worker_attendance = attendance_df[
+            (attendance_df['userId'] == worker_id) & 
+            (attendance_df['status'] == 'approved')
+        ]
+        
+        if len(worker_attendance) < 2:
+            return 0
+        
+        # Calculate standard deviation of work hours
+        work_hours = worker_attendance['workMinutes'] / 60
+        std_dev = work_hours.std()
+        
+        # Convert to consistency score (lower std_dev = higher consistency)
+        # Normalize to 0-100 scale
+        max_std = 4  # Assume max std deviation of 4 hours
+        consistency_score = max(0, (max_std - std_dev) / max_std * 100)
+        
+        return consistency_score
+    
+    def process_worker_data(self, workers_df, attendance_df):
+        """Process all worker data for clustering"""
+        processed_workers = []
+        
+        for _, worker in workers_df.iterrows():
+            worker_id = worker['userId']
+            
+            # Calculate performance metrics
+            attendance_rate = self.calculate_attendance_rate(worker_id, attendance_df)
+            avg_work_hours = self.calculate_avg_work_hours(worker_id, attendance_df)
+            punctuality_score = self.calculate_punctuality_score(worker_id, attendance_df)
+            consistency_score = self.calculate_consistency_score(worker_id, attendance_df)
+            
+            processed_worker = {
+                'userId': worker_id,
+                'name': worker.get('name', 'Unknown'),
+                'email': worker.get('email', ''),
+                'workerId': worker.get('workerId', ''),
+                'attendance_rate': attendance_rate,
+                'avg_work_hours': avg_work_hours,
+                'punctuality_score': punctuality_score,
+                'consistency_score': consistency_score,
+                'total_records': len(attendance_df[attendance_df['userId'] == worker_id])
+            }
+            
+            processed_workers.append(processed_worker)
+        
+        self.processed_data = pd.DataFrame(processed_workers)
+        logger.info(f"Processed data for {len(processed_workers)} workers")
+        
+        return self.processed_data
+    
+    def _calculate_working_days_from_config(self):
+        """Calculate working days from config date range excluding weekends"""
+        from config import Config
+        start_date = datetime.strptime(Config.START_DATE, '%Y-%m-%d')
+        end_date = datetime.strptime(Config.END_DATE, '%Y-%m-%d')
+        
+        working_days = 0
+        current_date = start_date
+        
+        while current_date <= end_date:
+            # Monday = 0, Sunday = 6
+            if current_date.weekday() < 5:  # Monday to Friday
+                working_days += 1
+            current_date += timedelta(days=1)
+        
+        return working_days
+    
+    def _is_punctual(self, clock_in_time, clock_out_time):
+        """Check if worker was punctual (simplified logic)"""
+        try:
+            # Parse time strings (format: "2024-12-19 09:43:30")
+            if not clock_in_time or not clock_out_time:
+                return False
+            
+            # Extract hour from clock in time (format: "2024-12-19 09:43:30")
+            time_part = clock_in_time.split(' ')[1]  # Get "09:43:30"
+            clock_in_hour = int(time_part.split(':')[0])  # Get hour
+            
+            # Consider punctual if clocked in before 8 AM (adjust as needed)
+            # You can modify this logic based on your company's work hours
+            return clock_in_hour <= 7  # Punctual if clock in at 7 AM or earlier
+        except:
+            return False
+    
+    def get_feature_matrix(self):
+        """Get feature matrix for clustering"""
+        if self.processed_data is None:
+            raise ValueError("Data not processed yet. Call process_worker_data first.")
+        
+        features = ['attendance_rate', 'avg_work_hours', 'punctuality_score', 'consistency_score']
+        return self.processed_data[features].values, features
+
+debug_firestore.py:
+#!/usr/bin/env python3
+"""
+Script untuk debug dan cek data Firestore
+"""
+
+from firebase_client import FirebaseClient
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def debug_firestore_data():
+    """Debug data di Firestore"""
+    try:
+        # Initialize Firebase client
+        firebase_client = FirebaseClient()
+        
+        # Check users collection
+        logger.info("=== CHECKING USERS COLLECTION ===")
+        users_ref = firebase_client.db.collection('users')
+        users = list(users_ref.limit(3).stream())
+        
+        logger.info(f"Found {len(users)} users (showing first 3):")
+        for user in users:
+            logger.info(f"User ID: {user.id}")
+            logger.info(f"User data: {user.to_dict()}")
+            logger.info("-" * 30)
+        
+        # Check attendance collection
+        logger.info("\n=== CHECKING ATTENDANCE COLLECTION ===")
+        attendance_ref = firebase_client.db.collection('attendance')
+        
+        # Get total count (approximate)
+        all_attendance = list(attendance_ref.limit(10).stream())
+        logger.info(f"Found {len(all_attendance)} attendance records (showing first 10):")
+        
+        for i, attendance in enumerate(all_attendance):
+            logger.info(f"Attendance {i+1}:")
+            logger.info(f"  ID: {attendance.id}")
+            data = attendance.to_dict()
+            logger.info(f"  Data: {data}")
+            
+            # Check date format
+            if 'date' in data:
+                logger.info(f"  Date format: {type(data['date'])} - {data['date']}")
+            logger.info("-" * 30)
+        
+        # Check collections list
+        logger.info("\n=== AVAILABLE COLLECTIONS ===")
+        collections = firebase_client.db.collections()
+        for collection in collections:
+            logger.info(f"Collection: {collection.id}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error debugging Firestore: {e}")
+        return False
+
+if __name__ == "__main__":
+    debug_firestore_data()
+
+firebase_client:
+import firebase_admin
+from firebase_admin import credentials, firestore
+from config import Config
+import pandas as pd
+from datetime import datetime, timedelta
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class FirebaseClient:
+    def __init__(self):
+        """Initialize Firebase client"""
+        try:
+            # Initialize Firebase Admin SDK
+            cred = credentials.Certificate(Config.FIREBASE_CREDENTIALS_PATH)
+            firebase_admin.initialize_app(cred)
+            self.db = firestore.client()
+            logger.info("Firebase client initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing Firebase: {e}")
+            raise
+    
+    def get_users_data(self):
+        """Fetch all users data from Firestore"""
+        try:
+            users_ref = self.db.collection('users')
+            users = users_ref.stream()
+            
+            users_data = []
+            for user in users:
+                user_data = user.to_dict()
+                user_data['userId'] = user.id
+                users_data.append(user_data)
+            
+            logger.info(f"Fetched {len(users_data)} users")
+            return users_data
+        except Exception as e:
+            logger.error(f"Error fetching users: {e}")
+            return []
+    
+    def get_attendance_data(self):
+        """Fetch attendance data from Firestore for the last N days"""
+        try:
+            # Use configured date range instead of days_back
+            start_date = datetime.strptime(Config.START_DATE, '%Y-%m-%d')
+            end_date = datetime.strptime(Config.END_DATE, '%Y-%m-%d')
+            
+            # Debug: Print date range
+            logger.info(f"Searching attendance from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+            
+            attendance_ref = self.db.collection('attendance')
+            
+            # Since Firestore uses DatetimeWithNanoseconds, we need to filter differently
+            # Convert our datetime to Firestore timestamp format
+            start_timestamp = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_timestamp = end_date.replace(hour=23, minute=59, second=59, microsecond=999999)
+            
+            # Query with timestamp comparison
+            query = attendance_ref.where('date', '>=', start_timestamp).where('date', '<=', end_timestamp)
+            
+            attendance_docs = query.stream()
+            
+            attendance_data = []
+            for doc in attendance_docs:
+                attendance_record = doc.to_dict()
+                attendance_record['attendanceId'] = doc.id
+                
+                # Convert DatetimeWithNanoseconds to string for easier processing
+                if 'date' in attendance_record and attendance_record['date']:
+                    attendance_record['date_string'] = attendance_record['date'].strftime('%Y-%m-%d')
+                if 'clockInTime' in attendance_record and attendance_record['clockInTime']:
+                    attendance_record['clockInTime_string'] = attendance_record['clockInTime'].strftime('%Y-%m-%d %H:%M:%S')
+                if 'clockOutTime' in attendance_record and attendance_record['clockOutTime']:
+                    attendance_record['clockOutTime_string'] = attendance_record['clockOutTime'].strftime('%Y-%m-%d %H:%M:%S')
+                
+                attendance_data.append(attendance_record)
+            
+            # If no data found with date filter, try without filter
+            if not attendance_data:
+                logger.warning("No data found with date filter, trying to get recent data...")
+                recent_query = attendance_ref.order_by('date', direction=firestore.Query.DESCENDING).limit(100)
+                recent_docs = recent_query.stream()
+                
+                for doc in recent_docs:
+                    attendance_record = doc.to_dict()
+                    attendance_record['attendanceId'] = doc.id
+                    
+                    # Convert DatetimeWithNanoseconds to string
+                    if 'date' in attendance_record and attendance_record['date']:
+                        attendance_record['date_string'] = attendance_record['date'].strftime('%Y-%m-%d')
+                        
+                        # Check if this record is within our date range
+                        record_date = attendance_record['date'].replace(tzinfo=None)
+                        if start_date <= record_date <= end_date:
+                            if 'clockInTime' in attendance_record and attendance_record['clockInTime']:
+                                attendance_record['clockInTime_string'] = attendance_record['clockInTime'].strftime('%Y-%m-%d %H:%M:%S')
+                            if 'clockOutTime' in attendance_record and attendance_record['clockOutTime']:
+                                attendance_record['clockOutTime_string'] = attendance_record['clockOutTime'].strftime('%Y-%m-%d %H:%M:%S')
+                            
+                            attendance_data.append(attendance_record)
+                
+                logger.info(f"Found {len(attendance_data)} attendance records within date range")
+            
+            logger.info(f"Total fetched: {len(attendance_data)} attendance records")
+            
+            # Debug: Show sample of processed data
+            if attendance_data:
+                logger.info("Sample processed attendance:")
+                sample = attendance_data[0]
+                logger.info(f"  Date: {sample.get('date_string', 'N/A')}")
+                logger.info(f"  User ID: {sample.get('userId', 'N/A')}")
+                logger.info(f"  Work Minutes: {sample.get('workMinutes', 'N/A')}")
+                logger.info(f"  Status: {sample.get('status', 'N/A')}")
+            
+            return attendance_data
+        except Exception as e:
+            logger.error(f"Error fetching attendance: {e}")
+            return []
+            attendance_data.append(attendance_record)
+                
+            logger.info(f"Found {len(attendance_data)} recent attendance records")
+            
+            logger.info(f"Fetched {len(attendance_data)} attendance records")
+            return attendance_data
+        except Exception as e:
+            logger.error(f"Error fetching attendance: {e}")
+            return []
+    
+    def get_worker_performance_data(self):
+        """Get comprehensive worker performance data"""
+        users = self.get_users_data()
+        attendance = self.get_attendance_data()
+        
+        # Convert to DataFrames for easier processing
+        users_df = pd.DataFrame(users)
+        attendance_df = pd.DataFrame(attendance)
+        
+        if attendance_df.empty:
+            logger.warning("No attendance data found")
+            return pd.DataFrame()
+        
+        # Filter only workers (not admin/HRD)
+        workers_df = users_df[users_df['role'] != 'admin'].copy()
+        
+        return workers_df, attendance_df
+
+kmeans_model.py:
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import json
+import os
+from config import Config
+import logging
+
+logger = logging.getLogger(__name__)
+
+class WorkerKMeansModel:
+    def __init__(self):
+        self.model = None
+        self.scaler = StandardScaler()
+        self.feature_names = None
+        self.cluster_centers_ = None
+        self.labels_ = None
+        
+    def train_model(self, feature_matrix, feature_names):
+        """Train K-means clustering model"""
+        self.feature_names = feature_names
+        
+        # Standardize features
+        X_scaled = self.scaler.fit_transform(feature_matrix)
+        
+        # Train K-means model
+        self.model = KMeans(
+            n_clusters=Config.N_CLUSTERS,
+            random_state=42,
+            n_init=10,
+            max_iter=300
+        )
+        
+        self.labels_ = self.model.fit_predict(X_scaled)
+        self.cluster_centers_ = self.model.cluster_centers_
+        
+        # Calculate silhouette score
+        silhouette_avg = silhouette_score(X_scaled, self.labels_)
+        logger.info(f"Silhouette Score: {silhouette_avg:.3f}")
+        
+        return self.labels_
+    
+    def predict_cluster(self, feature_matrix):
+        """Predict cluster for new data"""
+        if self.model is None:
+            raise ValueError("Model not trained yet")
+        
+        X_scaled = self.scaler.transform(feature_matrix)
+        return self.model.predict(X_scaled)
+    
+    def assign_performance_labels(self, processed_data, cluster_labels):
+        """Assign performance labels based on cluster characteristics"""
+        processed_data = processed_data.copy()
+        processed_data['cluster'] = cluster_labels
+        
+        # Calculate cluster means for each feature
+        cluster_means = processed_data.groupby('cluster')[
+            ['attendance_rate', 'avg_work_hours', 'punctuality_score', 'consistency_score']
+        ].mean()
+        
+        # Calculate overall performance score for each cluster
+        cluster_scores = {}
+        for cluster_id in range(Config.N_CLUSTERS):
+            cluster_data = cluster_means.loc[cluster_id]
+            
+            # Weighted performance score
+            score = (
+                cluster_data['attendance_rate'] * Config.FEATURE_WEIGHTS['attendance_rate'] +
+                min(cluster_data['avg_work_hours'] / 8 * 100, 100) * Config.FEATURE_WEIGHTS['avg_work_hours'] +
+                cluster_data['punctuality_score'] * Config.FEATURE_WEIGHTS['punctuality_score'] +
+                cluster_data['consistency_score'] * Config.FEATURE_WEIGHTS['consistency_score']
+            )
+            cluster_scores[cluster_id] = score
+        
+        # Sort clusters by performance score
+        sorted_clusters = sorted(cluster_scores.items(), key=lambda x: x[1])
+        
+        # Assign labels: lowest score = Low, highest = High
+        performance_mapping = {}
+        for i, (cluster_id, score) in enumerate(sorted_clusters):
+            if i == 0:
+                performance_mapping[cluster_id] = 'Low Performer'
+            elif i == 1:
+                performance_mapping[cluster_id] = 'Medium Performer'
+            else:
+                performance_mapping[cluster_id] = 'High Performer'
+        
+        # Add performance labels to data
+        processed_data['performance_label'] = processed_data['cluster'].map(performance_mapping)
+        
+        logger.info("Performance label mapping:")
+        for cluster_id, label in performance_mapping.items():
+            logger.info(f"Cluster {cluster_id}: {label} (Score: {cluster_scores[cluster_id]:.2f})")
+        
+        return processed_data, performance_mapping
+    
+    def visualize_clusters(self, processed_data, save_path='cluster_visualization.png'):
+        """Create visualization of clusters"""
+        plt.figure(figsize=(15, 10))
+        
+        # Create subplots for different feature combinations
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # Plot 1: Attendance Rate vs Avg Work Hours
+        scatter1 = axes[0, 0].scatter(
+            processed_data['attendance_rate'], 
+            processed_data['avg_work_hours'],
+            c=processed_data['cluster'], 
+            cmap='viridis', 
+            alpha=0.7
+        )
+        axes[0, 0].set_xlabel('Attendance Rate (%)')
+        axes[0, 0].set_ylabel('Average Work Hours')
+        axes[0, 0].set_title('Attendance Rate vs Work Hours')
+        
+        # Plot 2: Punctuality vs Consistency
+        scatter2 = axes[0, 1].scatter(
+            processed_data['punctuality_score'], 
+            processed_data['consistency_score'],
+            c=processed_data['cluster'], 
+            cmap='viridis', 
+            alpha=0.7
+        )
+        axes[0, 1].set_xlabel('Punctuality Score (%)')
+        axes[0, 1].set_ylabel('Consistency Score (%)')
+        axes[0, 1].set_title('Punctuality vs Consistency')
+        
+        # Plot 3: Performance distribution
+        performance_counts = processed_data['performance_label'].value_counts()
+        axes[1, 0].pie(performance_counts.values, labels=performance_counts.index, autopct='%1.1f%%')
+        axes[1, 0].set_title('Performance Distribution')
+        
+        # Plot 4: Feature comparison by cluster
+        cluster_means = processed_data.groupby('performance_label')[
+            ['attendance_rate', 'avg_work_hours', 'punctuality_score', 'consistency_score']
+        ].mean()
+        
+        cluster_means.plot(kind='bar', ax=axes[1, 1])
+        axes[1, 1].set_title('Average Features by Performance Level')
+        axes[1, 1].set_xlabel('Performance Level')
+        axes[1, 1].set_ylabel('Score')
+        axes[1, 1].legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        axes[1, 1].tick_params(axis='x', rotation=45)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        logger.info(f"Visualization saved to {save_path}")
+    
+    def save_model(self):
+        """Save trained model and scaler"""
+        os.makedirs('models', exist_ok=True)
+        
+        # Save model and scaler
+        joblib.dump(self.model, Config.MODEL_PATH)
+        joblib.dump(self.scaler, Config.SCALER_PATH)
+        
+        # Save metadata
+        metadata = {
+            'model_type': 'KMeans',
+            'n_clusters': Config.N_CLUSTERS,
+            'feature_names': self.feature_names,
+            'cluster_labels': Config.CLUSTER_LABELS,
+            'feature_weights': Config.FEATURE_WEIGHTS,
+            'created_at': pd.Timestamp.now().isoformat()
+        }
+        
+        with open(Config.METADATA_PATH, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        logger.info("Model saved successfully")
+    
+    def load_model(self):
+        """Load trained model and scaler"""
+        try:
+            self.model = joblib.load(Config.MODEL_PATH)
+            self.scaler = joblib.load(Config.SCALER_PATH)
+            
+            with open(Config.METADATA_PATH, 'r') as f:
+                metadata = json.load(f)
+                self.feature_names = metadata['feature_names']
+            
+            logger.info("Model loaded successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading model: {e}")
+            return False
+
+README.md:
+# Worker Performance Analysis - K-means Clustering Model
+
+Model machine learning untuk menganalisis performa karyawan menggunakan algoritma K-means clustering yang dapat diintegrasikan dengan aplikasi Android Kotlin.
+
+## 🎯 Fitur
+
+- **K-means Clustering**: Mengelompokkan karyawan menjadi 3 kategori (High, Medium, Low Performer)
+- **Multi-metric Analysis**: Menganalisis berdasarkan attendance rate, work hours, punctuality, dan consistency
+- **TensorFlow Lite Support**: Model dapat dijalankan di Android dengan TFLite
+- **Firebase Integration**: Mengambil data langsung dari Firestore
+- **Visualisasi**: Grafik dan chart untuk analisis performa
+
+## 📊 Metrics yang Dianalisis
+
+1. **Attendance Rate** (30%): Persentase kehadiran dalam periode tertentu
+2. **Average Work Hours** (25%): Rata-rata jam kerja per hari
+3. **Punctuality Score** (25%): Skor ketepatan waktu masuk/keluar
+4. **Consistency Score** (20%): Konsistensi jam kerja
+
+## 🚀 Setup dan Instalasi
+
+### 1. Persiapan Environment
+
+```bash
+# Clone atau download project ini
+# Buat virtual environment
+python -m venv venv
+
+# Aktivasi virtual environment
+# Windows:
+venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### 2. Konfigurasi Firebase
+
+1. Download service account key dari Firebase Console
+2. Simpan sebagai `firebase-credentials.json` di root folder
+3. Copy `.env.example` menjadi `.env`
+4. Update path credentials di `.env`
+
+```bash
+cp .env.example .env
+```
+
+### 3. Struktur Data Firestore
+
+Pastikan Firestore memiliki struktur berikut:
+
+**Collection: `users`**
+
+```json
+{
+  "userId": "string",
+  "name": "string",
+  "email": "string",
+  "role": "string", // "admin" atau "worker"
+  "workerId": "string"
+}
+```
+
+**Collection: `attendance`**
+
+```json
+{
+  "attendanceId": "string",
+  "userId": "string",
+  "date": "string", // "YYYY-MM-DD"
+  "clockInTime": "string", // ISO timestamp
+  "clockOutTime": "string", // ISO timestamp
+  "workMinutes": "number",
+  "overtimeMinutes": "number",
+  "status": "string" // "approved", "pending", etc.
+}
+```
+
+## 🔧 Cara Menjalankan
+
+### Training Model
+
+```bash
+python main.py
+```
+
+Script ini akan:
+
+1. Mengambil data dari Firestore
+2. Memproses data untuk clustering
+3. Melatih model K-means
+4. Membuat visualisasi
+5. Menyimpan model dalam format joblib dan TFLite
+6. Membuat metadata untuk integrasi Android
+
+### Output Files
+
+Setelah training berhasil, akan dibuat files:
+
+```
+models/
+├── kmeans_worker_model.joblib      # Model scikit-learn
+├── scaler.joblib                   # StandardScaler
+├── worker_analysis_model.tflite    # Model TensorFlow Lite
+├── model_metadata.json             # Metadata model
+└── tflite_model_info.json         # Info untuk Android
+
+cluster_visualization.png           # Visualisasi hasil clustering
+training.log                       # Log training process
+```
+
+## 📱 Integrasi dengan Android
+
+### 1. Copy Files ke Android Project
+
+Copy files berikut ke folder `assets` Android project:
+
+- `models/worker_analysis_model.tflite`
+- `models/tflite_model_info.json`
+
+### 2. Dependencies Android
+
+Tambahkan di `build.gradle` (app level):
+
+```gradle
+implementation 'org.tensorflow:tensorflow-lite:2.13.0'
+implementation 'org.tensorflow:tensorflow-lite-support:0.4.4'
+```
+
+### 3. Contoh Penggunaan di Kotlin
+
+```kotlin
+// Load model info
+val modelInfo = loadModelInfo()
+
+// Prepare input features
+val features = floatArrayOf(
+    attendanceRate,    // 0-100
+    avgWorkHours,      // 0-24
+    punctualityScore,  // 0-100
+    consistencyScore   // 0-100
+)
+
+// Run inference
+val cluster = runInference(features)
+val performanceLabel = getPerformanceLabel(cluster)
+```
+
+## 🔍 Monitoring dan Debugging
+
+### Logs
+
+Training process akan menghasilkan log detail di:
+
+- Console output
+- `training.log` file
+
+### Troubleshooting
+
+**Error: Firebase credentials not found**
+
+```bash
+# Pastikan file firebase-credentials.json ada
+# Update path di .env file
+```
+
+**Error: No data found**
+
+```bash
+# Cek koneksi Firestore
+# Pastikan ada data di collection users dan attendance
+# Cek filter tanggal (default: 30 hari terakhir)
+```
+
+**Error: TFLite conversion failed**
+
+```bash
+# Pastikan TensorFlow versi compatible
+# Cek apakah model scikit-learn berhasil disimpan
+```
+
+## 📈 Interpretasi Hasil
+
+### Performance Labels
+
+- **High Performer**: Attendance tinggi, jam kerja optimal, punctual, konsisten
+- **Medium Performer**: Performa rata-rata di sebagian besar metrics
+- **Low Performer**: Perlu improvement di beberapa area
+
+### Cluster Analysis
+
+Model akan menampilkan:
+
+- Distribusi karyawan per kategori
+- Rata-rata metrics per kategori
+- Visualisasi clustering
+- Silhouette score untuk evaluasi model
+
+## 🛠 Customization
+
+### Mengubah Weights Features
+
+Edit di `config.py`:
+
+```python
+FEATURE_WEIGHTS = {
+    'attendance_rate': 0.4,      # Increase attendance importance
+    'avg_work_hours': 0.2,
+    'punctuality_score': 0.3,
+    'consistency_score': 0.1
+}
+```
+
+### Mengubah Jumlah Cluster
+
+```python
+N_CLUSTERS = 4  # Untuk 4 kategori performance
+```
+
+### Mengubah Periode Analisis
+
+```python
+# Di main.py, ubah parameter days_back
+workers_df, attendance_df = firebase_client.get_worker_performance_data(days_back=60)
+```
+
+## 📝 Next Steps
+
+1. **Training Model**: Jalankan script untuk membuat model
+2. **Validasi Hasil**: Cek visualisasi dan metrics
+3. **Integrasi Android**: Copy files ke project Android
+4. **Testing**: Test model di aplikasi Android
+5. **Production**: Deploy ke production environment
+
+## 🤝 Support
+
+Jika ada pertanyaan atau issue:
+
+1. Cek log file untuk error details
+2. Pastikan data Firestore sesuai struktur
+3. Validasi Firebase credentials
+4. Test dengan data sample terlebih dahulu
+
+requirements.txt:
+# Core dependencies for machine learning
+pandas==2.0.3
+numpy==1.24.3
+scikit-learn==1.3.0
+matplotlib==3.7.2
+seaborn==0.12.2
+
+# Firebase dependencies
+firebase-admin==6.2.0
+google-cloud-firestore==2.11.1
+
+# TensorFlow for model conversion
+tensorflow==2.13.0
+
+# Additional utilities
+python-dotenv==1.0.0
+joblib==1.3.2
+
+test_model.py:
+#!/usr/bin/env python3
+"""
+Script untuk testing model yang sudah dilatih
+"""
+
+import numpy as np
+import pandas as pd
+import joblib
+import json
+import tensorflow as tf
+from config import Config
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def test_sklearn_model():
+    """Test scikit-learn model"""
+    try:
+        # Load model dan scaler
+        model = joblib.load(Config.MODEL_PATH)
+        scaler = joblib.load(Config.SCALER_PATH)
+        
+        # Sample data untuk testing
+        sample_data = np.array([
+            [95.0, 8.5, 90.0, 85.0],  # High performer
+            [75.0, 7.0, 70.0, 60.0],  # Medium performer  
+            [50.0, 5.5, 40.0, 30.0]   # Low performer
+        ])
+        
+        # Standardize dan predict
+        sample_scaled = scaler.transform(sample_data)
+        predictions = model.predict(sample_scaled)
+        
+        logger.info("Scikit-learn Model Test Results:")
+        for i, pred in enumerate(predictions):
+            logger.info(f"Sample {i+1}: Cluster {pred}")
+            logger.info(f"  Features: {sample_data[i]}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error testing sklearn model: {e}")
+        return False
+
+def test_tflite_model():
+    """Test TensorFlow Lite model"""
+    try:
+        # Load TFLite model
+        interpreter = tf.lite.Interpreter(model_path=Config.TFLITE_MODEL_PATH)
+        interpreter.allocate_tensors()
+        
+        # Get input and output details
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        logger.info("TFLite Model Details:")
+        logger.info(f"Input details: {input_details}")
+        logger.info(f"Output details: {output_details}")
+        
+        # Sample data
+        sample_data = np.array([[95.0, 8.5, 90.0, 85.0]], dtype=np.float32)
+        
+        # Set input tensor
+        interpreter.set_tensor(input_details[0]['index'], sample_data)
+        
+        # Run inference
+        interpreter.invoke()
+        
+        # Get output
+        cluster_output = interpreter.get_tensor(output_details[0]['index'])
+        distance_output = interpreter.get_tensor(output_details[1]['index'])
+        
+        logger.info("TFLite Model Test Results:")
+        logger.info(f"Input: {sample_data}")
+        logger.info(f"Predicted Cluster: {cluster_output}")
+        logger.info(f"Distance: {distance_output}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error testing TFLite model: {e}")
+        return False
+
+def compare_models():
+    """Compare sklearn and TFLite model outputs"""
+    try:
+        # Load sklearn model
+        sklearn_model = joblib.load(Config.MODEL_PATH)
+        scaler = joblib.load(Config.SCALER_PATH)
+        
+        # Load TFLite model
+        interpreter = tf.lite.Interpreter(model_path=Config.TFLITE_MODEL_PATH)
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        # Test samples
+        test_samples = np.array([
+            [95.0, 8.5, 90.0, 85.0],  # High performer
+            [75.0, 7.0, 70.0, 60.0],  # Medium performer  
+            [50.0, 5.5, 40.0, 30.0],  # Low performer
+            [85.0, 8.0, 80.0, 75.0],  # Another high performer
+            [65.0, 6.5, 60.0, 55.0]   # Another medium performer
+        ])
+        
+        logger.info("Model Comparison Results:")
+        logger.info("-" * 50)
+        
+        for i, sample in enumerate(test_samples):
+            # Sklearn prediction
+            sample_scaled = scaler.transform([sample])
+            sklearn_pred = sklearn_model.predict(sample_scaled)[0]
+            
+            # TFLite prediction
+            sample_tflite = sample.reshape(1, -1).astype(np.float32)
+            interpreter.set_tensor(input_details[0]['index'], sample_tflite)
+            interpreter.invoke()
+            tflite_pred = interpreter.get_tensor(output_details[0]['index'])[0]
+            
+            # Compare
+            match = "✓" if sklearn_pred == int(tflite_pred) else "✗"
+            
+            logger.info(f"Sample {i+1}: {sample}")
+            logger.info(f"  Sklearn: {sklearn_pred}, TFLite: {int(tflite_pred)} {match}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error comparing models: {e}")
+        return False
+
+def load_and_display_metadata():
+    """Load and display model metadata"""
+    try:
+        with open(Config.METADATA_PATH, 'r') as f:
+            metadata = json.load(f)
+        
+        logger.info("Model Metadata:")
+        logger.info("-" * 30)
+        for key, value in metadata.items():
+            logger.info(f"{key}: {value}")
+        
+        # Load TFLite info if exists
+        tflite_info_path = 'models/tflite_model_info.json'
+        try:
+            with open(tflite_info_path, 'r') as f:
+                tflite_info = json.load(f)
+            
+            logger.info("\nTFLite Model Info:")
+            logger.info("-" * 30)
+            logger.info(f"Input shape: {tflite_info['input_shape']}")
+            logger.info(f"Feature order: {tflite_info['feature_order']}")
+            logger.info(f"Performance mapping: {tflite_info['performance_mapping']}")
+            
+        except FileNotFoundError:
+            logger.warning("TFLite model info not found")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error loading metadata: {e}")
+        return False
+
+def main():
+    """Main testing function"""
+    logger.info("Starting Model Testing...")
+    
+    # Test 1: Load and display metadata
+    logger.info("\n1. Loading Model Metadata...")
+    load_and_display_metadata()
+    
+    # Test 2: Test sklearn model
+    logger.info("\n2. Testing Scikit-learn Model...")
+    test_sklearn_model()
+    
+    # Test 3: Test TFLite model
+    logger.info("\n3. Testing TensorFlow Lite Model...")
+    test_tflite_model()
+    
+    # Test 4: Compare models
+    logger.info("\n4. Comparing Model Outputs...")
+    compare_models()
+    
+    logger.info("\nTesting completed!")
+
+if __name__ == "__main__":
+    main()
+
+tflite_converter.py:
+import tensorflow as tf
+import numpy as np
+import joblib
+import json
+from config import Config
+import logging
+
+logger = logging.getLogger(__name__)
+
+class TFLiteConverter:
+    def __init__(self):
+        self.model = None
+        self.scaler = None
+    
+    def load_sklearn_model(self):
+        """Load the trained scikit-learn model"""
+        try:
+            self.model = joblib.load(Config.MODEL_PATH)
+            self.scaler = joblib.load(Config.SCALER_PATH)
+            logger.info("Scikit-learn model loaded successfully")
+            return True
+        except Exception as e:
+            logger.error(f"Error loading sklearn model: {e}")
+            return False
+    
+    def create_tensorflow_model(self):
+        """Create TensorFlow equivalent of the K-means model"""
+        if self.model is None or self.scaler is None:
+            raise ValueError("Sklearn model not loaded")
+        
+        # Get model parameters
+        cluster_centers = self.model.cluster_centers_
+        scaler_mean = self.scaler.mean_
+        scaler_scale = self.scaler.scale_
+        
+        # Convert to float32 to avoid type mismatch
+        cluster_centers = cluster_centers.astype(np.float32)
+        scaler_mean = scaler_mean.astype(np.float32)
+        scaler_scale = scaler_scale.astype(np.float32)
+        
+        # Create TensorFlow model
+        input_shape = (len(scaler_mean),)
+        
+        # Define the model
+        inputs = tf.keras.Input(shape=input_shape, name='input_features')
+        
+        # Standardization layer (equivalent to sklearn StandardScaler)
+        normalized = tf.keras.layers.Lambda(
+            lambda x: (x - scaler_mean) / scaler_scale,
+            name='standardization'
+        )(inputs)
+        
+        # K-means prediction layer
+        # Calculate distances to each cluster center
+        def kmeans_prediction(x):
+            # Expand dimensions for broadcasting
+            x_expanded = tf.expand_dims(x, axis=1)  # Shape: (batch_size, 1, n_features)
+            centers_expanded = tf.expand_dims(cluster_centers, axis=0)  # Shape: (1, n_clusters, n_features)
+            
+            # Calculate squared Euclidean distances
+            distances = tf.reduce_sum(tf.square(x_expanded - centers_expanded), axis=2)
+            
+            # Return the index of the closest cluster
+            predictions = tf.argmin(distances, axis=1)
+            
+            # Also return distances for confidence scoring
+            min_distances = tf.reduce_min(distances, axis=1)
+            
+            return tf.cast(predictions, tf.float32), min_distances
+        
+        predictions, distances = tf.keras.layers.Lambda(
+            kmeans_prediction,
+            name='kmeans_prediction'
+        )(normalized)
+        
+        # Create the model
+        tf_model = tf.keras.Model(
+            inputs=inputs,
+            outputs={'cluster': predictions, 'distance': distances},
+            name='worker_performance_kmeans'
+        )
+        
+        return tf_model
+    
+    def convert_to_tflite(self):
+        """Convert the TensorFlow model to TFLite"""
+        try:
+            # Create TensorFlow model
+            tf_model = self.create_tensorflow_model()
+            
+            # Convert to TFLite
+            converter = tf.lite.TFLiteConverter.from_keras_model(tf_model)
+            
+            # Optimization settings
+            converter.optimizations = [tf.lite.Optimize.DEFAULT]
+            converter.target_spec.supported_types = [tf.float32]
+            
+            # Convert
+            tflite_model = converter.convert()
+            
+            # Save the model
+            with open(Config.TFLITE_MODEL_PATH, 'wb') as f:
+                f.write(tflite_model)
+            
+            logger.info(f"TFLite model saved to {Config.TFLITE_MODEL_PATH}")
+            
+            # Create model info for Android
+            self._create_model_info()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error converting to TFLite: {e}")
+            return False
+    
+    def _create_model_info(self):
+        """Create model information file for Android integration"""
+        with open(Config.METADATA_PATH, 'r') as f:
+            metadata = json.load(f)
+        
+        # Add TFLite specific information
+        tflite_info = {
+            **metadata,
+            'tflite_model_path': Config.TFLITE_MODEL_PATH,
+            'input_shape': [1, len(self.scaler.mean_)],
+            'output_shape': [1],
+            'input_names': ['input_features'],
+            'output_names': ['cluster', 'distance'],
+            'feature_order': ['attendance_rate', 'avg_work_hours', 'punctuality_score', 'consistency_score'],
+            'scaler_params': {
+                'mean': self.scaler.mean_.tolist(),
+                'scale': self.scaler.scale_.tolist()
+            },
+            'cluster_centers': self.model.cluster_centers_.tolist(),
+            'performance_mapping': {
+                '0': 'Low Performer',
+                '1': 'Medium Performer', 
+                '2': 'High Performer'
+            }
+        }
+        
+        # Save updated metadata
+        tflite_metadata_path = 'models/tflite_model_info.json'
+        with open(tflite_metadata_path, 'w') as f:
+            json.dump(tflite_info, f, indent=2)
+        
+        logger.info(f"TFLite model info saved to {tflite_metadata_path}")
+    
+    def test_tflite_model(self, test_data):
+        """Test the TFLite model with sample data"""
+        try:
+            # Load TFLite model
+            interpreter = tf.lite.Interpreter(model_path=Config.TFLITE_MODEL_PATH)
+            interpreter.allocate_tensors()
+            
+            # Get input and output tensors
+            input_details = interpreter.get_input_details()
+            output_details = interpreter.get_output_details()
+            
+            logger.info("TFLite Model Details:")
+            logger.info(f"Input shape: {input_details[0]['shape']}")
+            logger.info(f"Output shape: {output_details[0]['shape']}")
+            
+            # Test with sample data
+            test_input = test_data.astype(np.float32)
+            interpreter.set_tensor(input_details[0]['index'], test_input)
+            
+            # Run inference
+            interpreter.invoke()
+            
+            # Get results
+            cluster_output = interpreter.get_tensor(output_details[0]['index'])
+            distance_output = interpreter.get_tensor(output_details[1]['index'])
+            
+            logger.info(f"Test prediction - Cluster: {cluster_output}, Distance: {distance_output}")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error testing TFLite model: {e}")
+            return False
+
+Log terakhir di terminal setelah running python main.py:
+INFO:__main__:Starting Worker Performance Analysis Model Training
+INFO:__main__:Step 1: Initializing Firebase client...
+INFO:firebase_client:Firebase client initialized successfully
+INFO:__main__:Step 2: Fetching data from Firestore...
+INFO:firebase_client:Fetched 21 users
+INFO:firebase_client:Searching attendance from 2024-11-01 to 2025-01-31
+D:\Dev\Machine Learning\clustering_analysis_worker\venv\Lib\site-packages\google\cloud\firestore_v1\base_collection.py:302: UserWarning: Detected filter using positional arguments. Prefer using the 'filter' keyword argument instead.
+  return query.where(field_path, op_string, value)
+D:\Dev\Machine Learning\clustering_analysis_worker\firebase_client.py:60: UserWarning: Detected filter using positional arguments. Prefer using the 'filter' keyword argument instead.
+  query = attendance_ref.where('date', '>=', start_timestamp).where('date', '<=', end_timestamp)
+INFO:firebase_client:Total fetched: 124 attendance records
+INFO:firebase_client:Sample processed attendance:
+INFO:firebase_client:  Date: 2024-12-11
+INFO:firebase_client:  User ID: lJW6RJg5A4Nd9ZmZgRzcXGVt2WC3
+INFO:firebase_client:  Work Minutes: 540
+INFO:firebase_client:  Status: approved
+INFO:__main__:Found 19 workers and 124 attendance records
+INFO:__main__:Step 3: Processing worker performance data...
+INFO:data_processor:Processed data for 19 workers
+INFO:__main__:Step 4: Preparing features for clustering...
+INFO:__main__:Feature matrix shape: (19, 4)
+INFO:__main__:Features: ['attendance_rate', 'avg_work_hours', 'punctuality_score', 'consistency_score']
+INFO:__main__:Step 5: Training K-means clustering model...
+INFO:kmeans_model:Silhouette Score: 0.778
+INFO:__main__:Step 6: Assigning performance labels...
+INFO:kmeans_model:Performance label mapping:
+INFO:kmeans_model:Cluster 1: Low Performer (Score: 1.79)
+INFO:kmeans_model:Cluster 0: Medium Performer (Score: 52.82)
+INFO:kmeans_model:Cluster 2: High Performer (Score: 65.88)
+INFO:__main__:Step 7: Creating visualizations...
+INFO:kmeans_model:Visualization saved to cluster_visualization.png
+INFO:__main__:Step 8: Saving the trained model...
+INFO:kmeans_model:Model saved successfully
+INFO:__main__:Step 9: Converting model to TensorFlow Lite...
+INFO:tflite_converter:Scikit-learn model loaded successfully
+2025-07-18 02:07:02.808926: I tensorflow/core/platform/cpu_feature_guard.cc:182] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: SSE SSE2 SSE3 SSE4.1 SSE4.2 AVX AVX2 AVX512F AVX512_VNNI FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+INFO:tensorflow:Assets written to: C:\Users\YOKIJA~1\AppData\Local\Temp\tmp81iew89c\assets
+2025-07-18 02:07:03.767237: W tensorflow/compiler/mlir/lite/python/tf_tfl_flatbuffer_helpers.cc:364] Ignored output_format.
+2025-07-18 02:07:03.767363: W tensorflow/compiler/mlir/lite/python/tf_tfl_flatbuffer_helpers.cc:367] Ignored drop_control_dependency.
+2025-07-18 02:07:03.770050: I tensorflow/cc/saved_model/reader.cc:45] Reading SavedModel from: C:\Users\YOKIJA~1\AppData\Local\Temp\tmp81iew89c
+2025-07-18 02:07:03.771428: I tensorflow/cc/saved_model/reader.cc:91] Reading meta graph with tags { serve }
+2025-07-18 02:07:03.771722: I tensorflow/cc/saved_model/reader.cc:132] Reading SavedModel debug info (if present) from: C:\Users\YOKIJA~1\AppData\Local\Temp\tmp81iew89c
+2025-07-18 02:07:03.776590: I tensorflow/compiler/mlir/mlir_graph_optimization_pass.cc:375] MLIR V1 optimization pass is not enabled
+2025-07-18 02:07:03.777218: I tensorflow/cc/saved_model/loader.cc:231] Restoring SavedModel bundle.
+2025-07-18 02:07:03.840184: I tensorflow/cc/saved_model/loader.cc:215] Running initialization op on SavedModel bundle at path: C:\Users\YOKIJA~1\AppData\Local\Temp\tmp81iew89c
+2025-07-18 02:07:03.846532: I tensorflow/cc/saved_model/loader.cc:314] SavedModel load for tags { serve }; Status: success: OK. Took 76276 microseconds.
+2025-07-18 02:07:03.884749: I tensorflow/compiler/mlir/tensorflow/utils/dump_mlir_util.cc:255] disabling MLIR crash reproducer, set env var `MLIR_CRASH_REPRODUCER_DIRECTORY` to enable.
+INFO:tflite_converter:TFLite model saved to models/worker_analysis_model.tflite
+INFO:tflite_converter:TFLite model info saved to models/tflite_model_info.json
+INFO:__main__:TFLite conversion successful!
+INFO:__main__:Step 10: Testing TFLite model...
+INFO: Created TensorFlow Lite XNNPACK delegate for CPU.
+INFO:tflite_converter:TFLite Model Details:
+INFO:tflite_converter:Input shape: [1 4]
+INFO:tflite_converter:Output shape: [1]
+INFO:tflite_converter:Test prediction - Cluster: [0.36983508], Distance: [2.]
+INFO:__main__:Step 11: Training completed successfully!
+INFO:__main__:
+==================================================
+INFO:__main__:TRAINING RESULTS SUMMARY
+INFO:__main__:==================================================
+INFO:__main__:
+Performance Distribution:
+INFO:__main__:  Low Performer: 10 workers (52.6%)
+INFO:__main__:  High Performer: 6 workers (31.6%)
+INFO:__main__:  Medium Performer: 3 workers (15.8%)
+INFO:__main__:
+Cluster to Performance Mapping:
+INFO:__main__:  Cluster 1: Low Performer
+INFO:__main__:  Cluster 0: Medium Performer
+INFO:__main__:  Cluster 2: High Performer
+INFO:__main__:
+Average Features by Performance Level:
+INFO:__main__:
+  High Performer:
+INFO:__main__:    attendance_rate: 7.83
+INFO:__main__:    avg_work_hours: 8.74
+INFO:__main__:    punctuality_score: 84.70
+INFO:__main__:    consistency_score: 86.77
+INFO:__main__:
+  Low Performer:
+INFO:__main__:    attendance_rate: 0.15
+INFO:__main__:    avg_work_hours: 0.56
+INFO:__main__:    punctuality_score: 0.00
+INFO:__main__:    consistency_score: 0.00
+INFO:__main__:
+  Medium Performer:
+INFO:__main__:    attendance_rate: 38.38
+INFO:__main__:    avg_work_hours: 6.86
+INFO:__main__:    punctuality_score: 23.63
+INFO:__main__:    consistency_score: 69.84
+INFO:__main__:
+Files Created:
+INFO:__main__:  - Model: models/kmeans_worker_model.joblib
+INFO:__main__:  - Scaler: models/scaler.joblib
+INFO:__main__:  - TFLite Model: models/worker_analysis_model.tflite
+INFO:__main__:  - Metadata: models/model_metadata.json
+INFO:__main__:  - TFLite Info: models/tflite_model_info.json
+INFO:__main__:  - Visualization: cluster_visualization.png
+INFO:__main__:  - Training Log: training.log
+INFO:__main__:Training pipeline completed successfully!
