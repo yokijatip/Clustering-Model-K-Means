@@ -1,0 +1,22 @@
+{
+  "model_type": "KMeans",
+  "n_clusters": 3,
+  "feature_names": [
+    "attendance_rate",
+    "avg_work_hours",
+    "punctuality_score",
+    "consistency_score"
+  ],
+  "cluster_labels": {
+    "0": "Low Performer",
+    "1": "Medium Performer",
+    "2": "High Performer"
+  },
+  "feature_weights": {
+    "attendance_rate": 0.3,
+    "avg_work_hours": 0.25,
+    "punctuality_score": 0.25,
+    "consistency_score": 0.2
+  },
+  "created_at": "2025-07-18T02:07:02.614913"
+}
