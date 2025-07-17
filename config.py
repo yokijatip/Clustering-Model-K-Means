@@ -9,8 +9,8 @@ class Config:
     FIREBASE_CREDENTIALS_PATH = os.getenv('FIREBASE_CREDENTIALS_PATH', 'firebase-credentials.json')
     
     # Date range configuration
-    START_DATE = '2024-11-01'  # Format: YYYY-MM-DD
-    END_DATE = '2025-01-31'    # Format: YYYY-MM-DD
+    START_DATE = '2025-01-01'  # Format: YYYY-MM-DD
+    END_DATE = '2025-12-31'    # Format: YYYY-MM-DD
     
     # Model configuration
     N_CLUSTERS = 3
